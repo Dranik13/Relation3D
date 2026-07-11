@@ -100,7 +100,7 @@ model:
     non_object_weight: 0.1
   test_cfg:
     topk_insts: 3200
-    score_thr: 0.0
+    score_thr: 0.03
     npoint_thr: 100
   norm_eval: False
   fix_module: []

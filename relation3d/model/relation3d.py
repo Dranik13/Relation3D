@@ -133,23 +133,52 @@ class Relation3D(nn.Module):
 
     @cuda_cast
     def predict(self, scan_ids, voxel_coords, p2v_map, v2p_map, spatial_shape, feats, insts, superpoints, coords_float,
-                batch_offsets, sp_instance_labels):
+                batch_offsets, sp_instance_labels, return_query_debug=False, nms_class_indices=None):
         batch_size = len(batch_offsets) - 1
         voxel_feats = pointgroup_ops.voxelization(feats, v2p_map)
         input = spconv.SparseConvTensor(voxel_feats, voxel_coords.int(), spatial_shape, batch_size)
         sp_coords1 = scatter_mean(coords_float, superpoints, dim=0)  # (B*M, media)
         sp_feats, weightmean, weightmax = self.extract_feat(input, superpoints, p2v_map, sp_coords1, coords_float)
         out, sp_feats_update_list, self_attn = self.decoder(sp_feats, sp_coords1, batch_offsets, self.epoch)
-        ret = self.predict_by_feat(scan_ids, out, superpoints, insts)
+        ret = self.predict_by_feat(
+            scan_ids,
+            out,
+            superpoints,
+            insts,
+            return_query_debug=return_query_debug,
+            nms_class_indices=nms_class_indices,
+        )
         return ret
 
-    def predict_by_feat(self, scan_ids, out, superpoints, insts):
+    def predict_by_feat(self, scan_ids, out, superpoints, insts, return_query_debug=False, nms_class_indices=None):
         pred_labels = out['labels']
         pred_masks = out['masks']
         pred_scores = out['scores']
+        query_instances = self.query_instances_by_feat(scan_ids, pred_labels, pred_masks, pred_scores, superpoints)
+        query_debug = None
+        if return_query_debug:
+            query_debug = {
+                'mask_logits': pred_masks[0].detach().float().cpu().numpy(),
+                'class_probabilities': F.softmax(
+                    pred_labels[0], dim=-1
+                )[:, :-1].detach().float().cpu().numpy(),
+                'mask_confidences': torch.clamp(
+                    pred_scores[0].reshape(-1), min=0.0, max=1.0
+                ).detach().float().cpu().numpy(),
+            }
 
         scores = F.softmax(pred_labels[0], dim=-1)[:, :-1]
-        nms_score = scores.max(-1)[0].squeeze()
+        if nms_class_indices is not None:
+            if not torch.is_tensor(nms_class_indices):
+                nms_class_indices = torch.as_tensor(nms_class_indices, device=scores.device)
+            nms_class_indices = nms_class_indices.to(device=scores.device, dtype=torch.long)
+            valid_class_mask = (nms_class_indices >= 0) & (nms_class_indices < scores.shape[1])
+            if valid_class_mask.any():
+                nms_score = scores.index_select(1, nms_class_indices[valid_class_mask]).max(-1)[0].squeeze()
+            else:
+                nms_score = scores.max(-1)[0].squeeze()
+        else:
+            nms_score = scores.max(-1)[0].squeeze()
         proposals_pred_f = (pred_masks[0]>0).float()
         intersection = torch.mm(proposals_pred_f, proposals_pred_f.t())  # (nProposal, nProposal), float, cuda
         proposals_pointnum = proposals_pred_f.sum(1)  # (nProposal), float, cuda
@@ -202,13 +231,45 @@ class Relation3D(nn.Module):
             pred = {}
             pred['scan_id'] = scan_ids[0]
             pred['label_id'] = cls_pred[i]
-            pred['conf'] = round(score_pred[i], 1)
+            pred['conf'] = float(score_pred[i])
             # rle encode mask to save memory
             pred['pred_mask'] = rle_encode(mask_pred[i])
             pred_instances.append(pred)
 
         gt_instances = insts[0].gt_instances
-        return dict(scan_id=scan_ids[0], pred_instances=pred_instances, gt_instances=gt_instances)
+        result = dict(
+            scan_id=scan_ids[0],
+            pred_instances=pred_instances,
+            query_instances=query_instances,
+            gt_instances=gt_instances,
+        )
+        if query_debug is not None:
+            result['query_debug'] = query_debug
+        return result
+
+    def query_instances_by_feat(self, scan_ids, pred_labels, pred_masks, pred_scores, superpoints):
+        scores = torch.clamp(pred_scores[0].reshape(-1), min=0.0, max=1.0)
+        masks = (pred_masks[0] > 0).int()
+        point_masks = masks[:, superpoints].int()
+        point_counts = point_masks.sum(1)
+
+        class_scores = F.softmax(pred_labels[0], dim=-1)[:, :-1]
+        top_class_confidences, top_class_indices = class_scores.max(-1)
+
+        query_instances = []
+        for query_id in range(point_masks.shape[0]):
+            pred = {}
+            pred['scan_id'] = scan_ids[0]
+            pred['source'] = 'query_mask'
+            pred['query_id'] = int(query_id)
+            pred['conf'] = float(scores[query_id].item())
+            pred['mask_confidence'] = float(scores[query_id].item())
+            pred['point_count'] = int(point_counts[query_id].item())
+            pred['top_label_id'] = int(top_class_indices[query_id].item()) + 1
+            pred['top_label_confidence'] = float(top_class_confidences[query_id].item())
+            pred['pred_mask'] = rle_encode(point_masks[query_id].detach().cpu().numpy())
+            query_instances.append(pred)
+        return query_instances
 
     def extract_feat(self, x, superpoints, v2p_map, sp_coords, coords_float):
         # backbone
